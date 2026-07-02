@@ -1,17 +1,17 @@
 #version 450
 #extension GL_ARB_separate_shader_objects : enable
 
-// PAL3-specific actor (skin) shader — fragment stage. Faithfully reproduces
-// the original PAL3 `gfxscript/skin_lit2.cg` lighting model:
+// PAL3-specific actor (skin) shader — fragment stage. The lighting is computed
+// per-vertex in `pal3_actor.vert` (faithful to the original `vs_1_1`
+// skin_1L/skin_2L.gbf Gouraud model); this stage only performs the texture
+// combine the original effect script declares:
 //
-//   color = texture * ( SUM_2lights( atten * max(N·L, 0) * diffuse ) + ambient )
+//   ColorOp[0] = Modulate; ColorArg1 = TEXTURE; ColorArg2 = CURRENT(=diffuse)
+//   AlphaOp[0] = Modulate; AlphaArg1 = TEXTURE; AlphaArg2 = CURRENT
 //
-// i.e. at most the two nearest omni point lights, a hard N·L clamp at 0 (no
-// fill/wrap floor), and ambient added flat. Point-light attenuation is the
-// Direct3D form 1/(a0 + a1·d + a2·d²); PAL3 ships FLT_MAX range so attenuation
-// is effectively 1 (the lights act near-directional). Diffuse is white via
-// the material tint. This is distinct from the shared `actor_lit` shader,
-// which sums all scene lights with a 0.2 wrap floor.
+// i.e. finalPixel = texture * interpolatedVertexColor. Computing the Lambert
+// term per-vertex (not per-pixel) is what gives the original its flat, evenly
+// lit characters.
 
 layout(constant_id = 0) const bool ALPHA_TEST = true;
 
@@ -39,7 +39,7 @@ layout(set = 3, binding = 0) uniform MaterialParams {
 
 layout(location = 0) in vec2 fragTexCoord;
 layout(location = 1) in vec3 fragWorldPos;
-layout(location = 2) in vec3 fragNormal;
+layout(location = 2) in vec3 fragColor;   // per-vertex Gouraud color (clamped)
 
 layout(location = 0) out vec4 outColor;
 
@@ -49,52 +49,8 @@ void main() {
         discard;
     }
 
-    vec3 N = normalize(fragNormal);
-    int count = int(perFrameUbo.ambient.w);
-
-    // PAL3 actors carry a near-full material ambient (skin.gbf shows the
-    // character fully visible on ambient alone); the scene's global ambient
-    // floor is only ~0.1 and is meant for scenery. Lift it so roles match the
-    // original's bright, evenly-lit look.
-    vec3 ambient = max(perFrameUbo.ambient.rgb, vec3(0.55));
-
-    // Pick the two nearest enabled lights, matching the original engine's
-    // 1-2 light skin shaders. The full table is at most 16 entries.
-    int best0 = -1, best1 = -1;
-    float d0 = 1e30, d1 = 1e30;
-    for (int i = 0; i < count; i++) {
-        float dist = distance(perFrameUbo.lightPos[i].xyz, fragWorldPos);
-        if (dist < d0) {
-            d1 = d0; best1 = best0;
-            d0 = dist; best0 = i;
-        } else if (dist < d1) {
-            d1 = dist; best1 = i;
-        }
-    }
-
-    vec3 lit = ambient;
-    int idx[2] = int[2](best0, best1);
-    for (int k = 0; k < 2; k++) {
-        int i = idx[k];
-        if (i < 0) continue;
-        vec3 d = perFrameUbo.lightPos[i].xyz - fragWorldPos;
-        float dist = length(d);
-        vec3 L = dist > 0.0 ? d / dist : vec3(0.0, 1.0, 0.0);
-
-        // PAL3 omni lights ship FLT_MAX range (no attenuation); treat any very
-        // large outer radius as infinite, else use the D3D point-light cutoff.
-        float outer = perFrameUbo.lightPos[i].w;
-        float inner = perFrameUbo.lightColor[i].w;
-        float atten = 1.0;
-        if (outer < 1.0e18) {
-            float edge0 = max(inner, outer * 0.85);
-            atten = 1.0 - smoothstep(edge0, outer, dist);
-        }
-
-        lit += perFrameUbo.lightColor[i].rgb * max(dot(N, L), 0.0) * atten;
-    }
-
-    vec3 rgb = sampled.rgb * lit * mat.tint.rgb * mat.tint.a;
+    // finalPixel = texture * interpolated vertex color (ColorOp = Modulate).
+    vec3 rgb = sampled.rgb * fragColor * mat.tint.rgb * mat.tint.a;
     outColor = vec4(rgb, sampled.a * mat.tint.a);
 
     // Linear distance fog, matching the shared shaders' eye-space fog.
