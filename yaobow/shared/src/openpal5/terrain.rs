@@ -3,8 +3,18 @@
 //!
 //! Each map block (`<map>_<r>_<c>.mp` + `alphamap_<r>_<c>.alp`) becomes one
 //! [`Geometry`]: a 16×16-patch heightfield (257×257 vertices, 20 world
-//! units/cell) textured with a [`TerrainSplatMaterialDef`] that blends the
-//! block's up-to-four terrain textures per-texel by a weight atlas.
+//! units/cell) textured with a [`TerrainSplatMaterialDef`] that composites the
+//! block's up-to-four terrain textures per-texel using the original engine's
+//! ordered alpha-"over" model.
+//!
+//! ## Blend model (reverse-engineered from `Pal5.exe`)
+//! The original draws each terrain chunk as a base layer (opaque, the `.alp`
+//! primary byte `b2` → slot 2) plus alpha-blended overlay layers
+//! (SRCALPHA / INVSRCALPHA) in paint order `b1, b0, b3` → slots 1, 0, 3, the
+//! per-vertex alpha being each layer's weight. The splat shader replicates this
+//! per texel: `col = slot2; col = mix(col, slot1, w1); mix(col, slot0, w0);
+//! mix(col, slot3, w3)`. This keeps dominant overlays clean instead of muddily
+//! averaging all four layers (the previous normalized weighted-sum).
 //!
 //! ## Data flow
 //! * Heights + per-vertex normals come from the `.mp` patches (absolute
@@ -12,14 +22,12 @@
 //! * The four layer texture ids come from the `.mp` block footer
 //!   ([`fileformats::pal5::mp::MpFile::texture_ids`]); `-1` = unused.
 //! * Per-texel layer weights come from the `.alp` patches
-//!   ([`fileformats::pal5::alp`]): slot `s`'s 64×64 raster, in slot order.
-//!   They are packed into one `1024×1024` RGBA weight atlas per block (one
-//!   `64×64` tile per patch; R/G/B/A = slots 0/1/2/3).
-//!
-//! Weight that lands on an **unused** slot (texture id `-1`, observed up to
-//! ~12% on some blocks) is folded into the base layer so the shader never
-//! samples an undefined texture — the dominant layer is always a valid
-//! slot, so this only collapses minor overlay detail into the base.
+//!   ([`fileformats::pal5::alp`]): `planes[s]` is texture slot `s`'s 64×64
+//!   raster (one channel per slot, byte `b_s`). They are packed into one
+//!   `1024×1024` RGBA weight atlas per block (one `64×64` tile per patch;
+//!   R/G/B/A = slots 0/1/2/3). Slot 2's weight is unused by the shader (the
+//!   base is unconditional); overlay weight on an **unused** slot (texture id
+//!   `-1`) is zeroed so the shader never blends in the base-fallback texture.
 //!
 //! The terrain textures are loaded **opaque** (their `.dds` alpha is
 //! non-coverage detail data; left as coverage it premultiplies the RGB
@@ -67,7 +75,7 @@ pub fn build_terrain_entity(
 
     let geometries: Vec<Geometry> = blocks
         .iter()
-        .filter_map(|block| build_block_geometry(asset_loader, map_name, block))
+        .flat_map(|block| build_block_geometries(asset_loader, map_name, block))
         .collect();
     if geometries.is_empty() {
         return None;
@@ -81,57 +89,160 @@ pub fn build_terrain_entity(
     Some(entity)
 }
 
-/// Build one block's splat geometry, or `None` if the block is empty.
-fn build_block_geometry(
+// ---- PAL5 terrain texture pipeline (RE-corrected model) --------------------
+//
+// Each `.mp` patch carries an **overlay palette** (up to 4 `TextureID`s), a
+// per-vertex overlay-`layer` assignment, and a **base ground** id (`dibiao*`);
+// the matching `.alp` patch supplies per-texel RGBA blend weights. The original
+// `terra{N}.psh` renders each patch as a **linear weighted sum** of its N
+// overlay textures by those weights (`color = Σ tex_i * weight_i`); untextured
+// patches (no palette) show the block default ground. We reproduce this with
+// [`TerrainSplatMaterialDef`] (weighted-sum `terrain_splat.frag`).
+//
+// `.alp` byte → shader-slot mapping: the engine copies the `.alp` RGBA raster
+// verbatim into an A8R8G8B8 blend texture, so `terra{N}` sees
+// `blend.rgba = (b2, b1, b0, b3)` weighting palette slots 0..3 — i.e. slot `j`
+// reads packed byte [`SLOT_TO_BYTE[j]`]. (`alp::AlpPatch::planes[k]` is byte
+// `b_k`.) See `generated/pal5_terrain_{shader_spec,loader_re}.md`.
+
+/// Packed-`.alp`-byte index feeding each shader slot / palette entry (from the
+/// verbatim A8R8G8B8 copy: slot0←b2, slot1←b1, slot2←b0, slot3←b3).
+const SLOT_TO_BYTE: [usize; 4] = [2, 1, 0, 3];
+
+/// The four terrain-texture layer ids for a patch (slot 0 first; `-1` = unused):
+/// the patch's own overlay palette ([`fileformats::pal5::mp::MpPatch::tex_table`])
+/// if it carries one, else the block footer default
+/// ([`fileformats::pal5::mp::MpFile::texture_ids`]). Both pair with the same
+/// `.alp` RGBA weights (identity channel order, remapped by [`SLOT_TO_BYTE`]).
+fn patch_layer_ids(patch: &fileformats::pal5::mp::MpPatch, footer: [i32; 4]) -> [i32; 4] {
+    if patch.tex_table.iter().any(|&id| id >= 0) {
+        patch.tex_table
+    } else {
+        footer
+    }
+}
+
+/// Build every geometry for one block: one per distinct material group
+/// (overlay palette / default ground). Each patch is drawn exactly once as a
+/// weighted-sum splat — no base-grid vs. road split.
+fn build_block_geometries(
     asset_loader: &AssetLoader,
     map_name: &str,
     block: &MapBlock,
-) -> Option<Geometry> {
+) -> Vec<Geometry> {
     let mp = &block.mp;
     if mp.patches.is_empty() {
+        return vec![];
+    }
+    let (block_min_x, block_min_z) = block_origin(block);
+    let footer = mp.texture_ids;
+
+    // Group patches by their 4 layer-texture ids (own palette or footer) so each
+    // distinct material is one draw.
+    let mut groups: Vec<([i32; 4], Vec<usize>)> = Vec::new();
+    for (pi, patch) in mp.patches.iter().enumerate() {
+        let key = patch_layer_ids(patch, footer);
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, idxs)) => idxs.push(pi),
+            None => groups.push((key, vec![pi])),
+        }
+    }
+
+    let mut geometries = Vec::new();
+    for (gi, (layer_ids, patch_idxs)) in groups.iter().enumerate() {
+        if let Some(g) = build_group_geometry(
+            asset_loader,
+            map_name,
+            block,
+            block_min_x,
+            block_min_z,
+            *layer_ids,
+            patch_idxs,
+            gi,
+        ) {
+            geometries.push(g);
+        }
+    }
+    geometries
+}
+
+/// Build one material group's geometry: every patch's 17×17 grid plus a weight
+/// atlas whose per-patch tile carries the `.alp` blend weights for the group's
+/// four layer textures.
+#[allow(clippy::too_many_arguments)]
+fn build_group_geometry(
+    asset_loader: &AssetLoader,
+    map_name: &str,
+    block: &MapBlock,
+    block_min_x: f32,
+    block_min_z: f32,
+    layer_ids: [i32; 4],
+    patch_idxs: &[usize],
+    group_idx: usize,
+) -> Option<Geometry> {
+    let mp = &block.mp;
+
+    let mut vertices = Vec::new();
+    let mut normals = Vec::new();
+    let mut texcoords = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+    let mut atlas =
+        RgbaImage::from_pixel(ATLAS_EDGE as u32, ATLAS_EDGE as u32, Rgba([0, 0, 0, 0]));
+
+    for &pi in patch_idxs {
+        let patch = &mp.patches[pi];
+        let lx = ((patch.min_x - block_min_x) / PATCH_WORLD_SIZE).round() as i64;
+        let lz = ((patch.min_z - block_min_z) / PATCH_WORLD_SIZE).round() as i64;
+        if !(0..PATCHES_PER_BLOCK as i64).contains(&lx)
+            || !(0..PATCHES_PER_BLOCK as i64).contains(&lz)
+        {
+            continue;
+        }
+        let (lx, lz) = (lx as usize, lz as usize);
+
+        // Weight tile from the `.alp` RGBA raster (remapped by SLOT_TO_BYTE),
+        // zeroing unused layer slots; fall back to the patch's own per-vertex
+        // layer assignment when the block has no decoded `.alp`.
+        match block.alp.as_ref().and_then(|alp| alp.patch(lx, lz)) {
+            Some(ap) if ap.planes.len() >= 4 => {
+                write_overlay_weights(&mut atlas, ap, layer_ids, lx, lz);
+            }
+            _ => write_vertex_layer_weights(&mut atlas, patch, layer_ids, lx, lz),
+        }
+
+        // Emit this patch's 17×17 vertex grid.
+        let base_vert = vertices.len() as u32;
+        for row in 0..PATCH_EDGE {
+            for col in 0..PATCH_EDGE {
+                let wx = patch.min_x + col as f32 * CELL_WORLD_SIZE;
+                let wz = patch.min_z + row as f32 * CELL_WORLD_SIZE;
+                let v = row * PATCH_EDGE + col;
+                vertices.push(Vec3::new(wx, patch.heights[v], wz));
+                let nm = &patch.normals[v];
+                normals.push(Vec3::new(nm.x, nm.y, nm.z));
+                // Block-local UV addresses this patch's weight-atlas tile; the
+                // ground textures tile in world space in the shader.
+                texcoords.push(TexCoord::new(
+                    (wx - block_min_x) / (CELLS_PER_BLOCK as f32 * CELL_WORLD_SIZE),
+                    (wz - block_min_z) / (CELLS_PER_BLOCK as f32 * CELL_WORLD_SIZE),
+                ));
+            }
+        }
+        for row in 0..PATCH_EDGE - 1 {
+            for col in 0..PATCH_EDGE - 1 {
+                let tl = base_vert + (row * PATCH_EDGE + col) as u32;
+                let tr = tl + 1;
+                let bl = base_vert + ((row + 1) * PATCH_EDGE + col) as u32;
+                let br = bl + 1;
+                indices.extend_from_slice(&[tl, bl, tr, tr, bl, br]);
+            }
+        }
+    }
+    if indices.is_empty() {
         return None;
     }
 
-    // Block origin in world space: snap the minimum patch origin down to the
-    // block grid (patch origins are absolute; a block spans 5120 units).
-    let (block_min_x, block_min_z) = block_origin(block);
-
-    let (height, normal, _known) = build_block_height_field(mp, block_min_x, block_min_z);
-    let atlas = build_weight_atlas(block, mp.texture_ids, block_min_x, block_min_z);
-    let material = block_material(asset_loader, map_name, block, atlas);
-
-    // Emit the 257×257 vertex grid. `known` cells with no decoded height are
-    // dilate-filled (notably the block's omitted (0,0) patch).
-    let n = VERTS_PER_BLOCK;
-    let mut vertices = Vec::with_capacity(n * n);
-    let mut normals = Vec::with_capacity(n * n);
-    let mut texcoords = Vec::with_capacity(n * n);
-    for gx in 0..n {
-        for gz in 0..n {
-            let wx = block_min_x + gx as f32 * CELL_WORLD_SIZE;
-            let wz = block_min_z + gz as f32 * CELL_WORLD_SIZE;
-            let i = gx * n + gz;
-            vertices.push(Vec3::new(wx, height[i], wz));
-            normals.push(normal[i]);
-            // Weight-atlas UV: block-local position normalized to [0,1].
-            texcoords.push(TexCoord::new(
-                gx as f32 / CELLS_PER_BLOCK as f32,
-                gz as f32 / CELLS_PER_BLOCK as f32,
-            ));
-        }
-    }
-
-    let mut indices = Vec::with_capacity((n - 1) * (n - 1) * 6);
-    for gx in 0..n - 1 {
-        for gz in 0..n - 1 {
-            let tl = (gx * n + gz) as u32;
-            let tr = tl + 1;
-            let bl = ((gx + 1) * n + gz) as u32;
-            let br = bl + 1;
-            indices.extend_from_slice(&[tl, bl, tr, tr, bl, br]);
-        }
-    }
-
+    let material = group_material(asset_loader, map_name, block, layer_ids, group_idx, atlas);
     Some(Geometry::new(
         &vertices,
         Some(&normals),
@@ -139,6 +250,113 @@ fn build_block_geometry(
         indices,
         material,
     ))
+}
+
+/// Write a textured patch's 64×64 atlas tile from its `.alp` RGBA weights,
+/// mapping packed byte `b_{SLOT_TO_BYTE[slot]}` → slot and zeroing any slot
+/// whose overlay id is unused (`-1`).
+fn write_overlay_weights(
+    atlas: &mut RgbaImage,
+    ap: &fileformats::pal5::alp::AlpPatch,
+    layer_ids: [i32; 4],
+    lx: usize,
+    lz: usize,
+) {
+    let base_x = lx * WEIGHT_EDGE;
+    let base_z = lz * WEIGHT_EDGE;
+    for r in 0..WEIGHT_EDGE {
+        for c in 0..WEIGHT_EDGE {
+            let t = r * WEIGHT_EDGE + c;
+            let mut w = [0u8; 4];
+            for slot in 0..4 {
+                if layer_ids[slot] >= 0 {
+                    w[slot] = ap.planes[SLOT_TO_BYTE[slot]][t];
+                }
+            }
+            atlas.put_pixel((base_x + c) as u32, (base_z + r) as u32, Rgba(w));
+        }
+    }
+}
+
+/// Fallback tile (no decoded `.alp`): one-hot weights from the patch's own
+/// per-vertex overlay-layer assignment; unpainted vertices fall to slot 0.
+fn write_vertex_layer_weights(
+    atlas: &mut RgbaImage,
+    patch: &fileformats::pal5::mp::MpPatch,
+    layer_ids: [i32; 4],
+    lx: usize,
+    lz: usize,
+) {
+    let base_x = lx * WEIGHT_EDGE;
+    let base_z = lz * WEIGHT_EDGE;
+    for r in 0..WEIGHT_EDGE {
+        for c in 0..WEIGHT_EDGE {
+            let vr = (r * (PATCH_EDGE - 1) + WEIGHT_EDGE / 2) / WEIGHT_EDGE;
+            let vc = (c * (PATCH_EDGE - 1) + WEIGHT_EDGE / 2) / WEIGHT_EDGE;
+            let v = vr.min(PATCH_EDGE - 1) * PATCH_EDGE + vc.min(PATCH_EDGE - 1);
+            let layer = patch.vert_layer[v];
+            let slot = if (0..=3).contains(&layer) && layer_ids[layer as usize] >= 0 {
+                layer as usize
+            } else {
+                0
+            };
+            let mut w = [0u8; 4];
+            w[slot] = 255;
+            atlas.put_pixel((base_x + c) as u32, (base_z + r) as u32, Rgba(w));
+        }
+    }
+}
+
+/// Build the splat material for a group: bind its up-to-4 layer textures + the
+/// per-patch weight atlas. Unused slots repeat slot 0's texture (their atlas
+/// weight is 0). `active_layers` = number of bound (non-`-1`) layers.
+fn group_material(
+    asset_loader: &AssetLoader,
+    map_name: &str,
+    block: &MapBlock,
+    layer_ids: [i32; 4],
+    group_idx: usize,
+    atlas: RgbaImage,
+) -> MaterialDef {
+    let base_name = layer_ids
+        .iter()
+        .find(|&&id| id >= 0)
+        .and_then(|&id| terrain_texture_name(id as u8))
+        .unwrap_or(FALLBACK_TEXTURE);
+    let load_layer = |id: i32| -> TerrainLayer {
+        let name = if id >= 0 {
+            terrain_texture_name(id as u8).unwrap_or(base_name)
+        } else {
+            base_name
+        };
+        let path = format!("/Texture/TerrainTexture/{}", name);
+        TerrainLayer {
+            name: path.clone(),
+            data: asset_loader.read_file(&path).ok(),
+        }
+    };
+    let layers = [
+        load_layer(layer_ids[0]),
+        load_layer(layer_ids[1]),
+        load_layer(layer_ids[2]),
+        load_layer(layer_ids[3]),
+    ];
+    let active_layers = layer_ids.iter().filter(|&&id| id >= 0).count().max(1) as u8;
+    let atlas_name = format!(
+        "pal5_terrain/{}_{}_{}_{}",
+        map_name, block.row, block.col, group_idx
+    );
+    TerrainSplatMaterialDef::create(
+        &format!(
+            "{}_terrain_{}_{}_{}",
+            map_name, block.row, block.col, group_idx
+        ),
+        layers,
+        &atlas_name,
+        atlas,
+        active_layers,
+        TEX_TILE_WORLD,
+    )
 }
 
 /// Compute a block's world origin (minimum patch origin snapped to the block
@@ -266,128 +484,6 @@ fn build_block_height_field(
     let real = known.clone();
     fill_unknown_heights(&mut height, &mut normal, &mut known, n);
     (height, normal, real)
-}
-
-/// Build the block's `1024×1024` RGBA weight atlas (one `64×64` tile per
-/// patch; R/G/B/A = slot 0/1/2/3 weights). Weight on slots whose texture id
-/// is `-1` is folded into the base layer. Cells with no decoded patch get a
-/// full-base weight (`R = 255`).
-fn build_weight_atlas(
-    block: &MapBlock,
-    texture_ids: [i32; 4],
-    block_min_x: f32,
-    block_min_z: f32,
-) -> RgbaImage {
-    let mut atlas =
-        RgbaImage::from_pixel(ATLAS_EDGE as u32, ATLAS_EDGE as u32, Rgba([255, 0, 0, 0]));
-    let Some(alp) = block.alp.as_ref() else {
-        return atlas; // base-only block
-    };
-
-    for patch in &block.mp.patches {
-        let lx = ((patch.min_x - block_min_x) / PATCH_WORLD_SIZE).round() as i64;
-        let lz = ((patch.min_z - block_min_z) / PATCH_WORLD_SIZE).round() as i64;
-        if lx < 0 || lz < 0 || lx as usize >= PATCHES_PER_BLOCK || lz as usize >= PATCHES_PER_BLOCK
-        {
-            continue;
-        }
-        let Some(ap) = alp.patch(lx as usize, lz as usize) else {
-            continue;
-        };
-        write_patch_weights(&mut atlas, ap, texture_ids, lx as usize, lz as usize);
-    }
-    atlas
-}
-
-/// Write one patch's `64×64` weights into its atlas tile, folding unused-slot
-/// weight into the base layer.
-fn write_patch_weights(
-    atlas: &mut RgbaImage,
-    ap: &fileformats::pal5::alp::AlpPatch,
-    texture_ids: [i32; 4],
-    lx: usize,
-    lz: usize,
-) {
-    let base_x = lx * WEIGHT_EDGE;
-    let base_z = lz * WEIGHT_EDGE;
-    for row in 0..WEIGHT_EDGE {
-        for col in 0..WEIGHT_EDGE {
-            let t = row * WEIGHT_EDGE + col;
-            let mut w = [0u32; 4];
-            for slot in 0..ap.layer_count as usize {
-                w[slot] = ap.planes[slot][t] as u32;
-            }
-            // Fold weight on unused slots (id < 0) into the base layer so the
-            // shader never samples an undefined texture.
-            for slot in 1..4 {
-                if texture_ids[slot] < 0 {
-                    w[0] += w[slot];
-                    w[slot] = 0;
-                }
-            }
-            atlas.put_pixel(
-                (base_x + col) as u32,
-                (base_z + row) as u32,
-                Rgba([
-                    w[0].min(255) as u8,
-                    w[1].min(255) as u8,
-                    w[2].min(255) as u8,
-                    w[3].min(255) as u8,
-                ]),
-            );
-        }
-    }
-}
-
-/// Build the splat material for a block from its footer texture ids + atlas.
-fn block_material(
-    asset_loader: &AssetLoader,
-    map_name: &str,
-    block: &MapBlock,
-    atlas: RgbaImage,
-) -> MaterialDef {
-    let ids = block.mp.texture_ids;
-    // Base texture id: first valid slot, else the fallback.
-    let base_name = ids
-        .iter()
-        .find(|&&id| id >= 0)
-        .and_then(|&id| terrain_texture_name(id as u8))
-        .unwrap_or(FALLBACK_TEXTURE);
-
-    let load_layer = |id: i32| -> TerrainLayer {
-        let name = if id >= 0 {
-            terrain_texture_name(id as u8).unwrap_or(base_name)
-        } else {
-            // Unused slot: bind the base texture (its atlas weight is 0).
-            base_name
-        };
-        let path = format!("/Texture/TerrainTexture/{}", name);
-        TerrainLayer {
-            name: path.clone(),
-            data: asset_loader.read_file(&path).ok(),
-        }
-    };
-
-    let layers = [
-        load_layer(ids[0]),
-        load_layer(ids[1]),
-        load_layer(ids[2]),
-        load_layer(ids[3]),
-    ];
-
-    let atlas_name = format!(
-        "pal5_terrain_weights/{}_{}_{}",
-        map_name, block.row, block.col
-    );
-
-    TerrainSplatMaterialDef::create(
-        &format!("{}_terrain_{}_{}", map_name, block.row, block.col),
-        layers,
-        &atlas_name,
-        atlas,
-        4,
-        TEX_TILE_WORLD,
-    )
 }
 
 /// Fill grid cells with no decoded height/normal by repeatedly averaging

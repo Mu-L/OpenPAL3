@@ -3,12 +3,17 @@
 
 // PAL5 terrain splat — fragment stage.
 //
-// Blends up to four terrain textures per-texel by a weight atlas, then
-// applies the same dynamic Lambert lighting as `actor_lit.frag`.
+// Composites up to four terrain textures per-texel by a weight atlas using the
+// original engine's LINEAR WEIGHTED SUM (reverse-engineered from the shipped
+// `terra{N}.psh`): `color = Σ_i tex_i(tileUV) * weight_i`. Unused slots carry
+// zero weight; an overlay patch's active-layer weights sum to ~1, and an
+// untextured patch is full weight on slot 0 (its base ground). Then applies the
+// same dynamic Lambert lighting as `actor_lit.frag`.
 //
 // Texture bindings (set 2, `texSampler[5]`):
 //   texSampler[0..3] = terrain-texture layers for slots 0..3 (unused slots
-//                      are padded with slot 0's texture)
+//                      are padded with the base texture; their atlas weight is
+//                      zeroed so they never blend in)
 //   texSampler[4]    = per-block weight atlas; RGBA = slots 0,1,2,3 weights
 //
 // The weight atlas is sampled with the per-block UV (`fragAtlasUV`); the
@@ -88,22 +93,21 @@ void main() {
     // world units).
     vec2 tileUV = fragWorldPos.xz * mat.uv_xform.xy;
 
-    // Per-texel layer weights (already normalized so active layers sum to 1).
+    // Per-texel layer weights: r/g/b/a = overlay palette slot 0/1/2/3.
     vec4 w = texture(texSampler[4], fragAtlasUV);
-    int layers = int(mat.misc.x + 0.5);
 
-    vec3 base = texture(texSampler[0], tileUV).rgb;
-    vec3 col = base * w.r;
-    if (layers > 1) col += texture(texSampler[1], tileUV).rgb * w.g;
-    if (layers > 2) col += texture(texSampler[2], tileUV).rgb * w.b;
-    if (layers > 3) col += texture(texSampler[3], tileUV).rgb * w.a;
-
-    // Guard against an all-zero weight texel (e.g. atlas seam): fall back to
-    // the base layer so terrain never shows black.
-    float wsum = w.r + (layers > 1 ? w.g : 0.0)
-                     + (layers > 2 ? w.b : 0.0)
-                     + (layers > 3 ? w.a : 0.0);
-    if (wsum < 0.001) col = base;
+    // Faithful to the original `terra{N}.psh` (reverse-engineered from the
+    // shipped shaders): terrain is a LINEAR WEIGHTED SUM of the up-to-four
+    // ground textures by the `.alp` blend weights —
+    //   color = Σ_i tex_i(tileUV) * weight_i
+    // Unused slots carry zero weight; for an overlay patch the weights sum to
+    // ~1 across its active layers, and an untextured patch is full weight on
+    // slot 0 (its base ground). No dominant-base/alpha-over.
+    vec3 t0 = texture(texSampler[0], tileUV).rgb;
+    vec3 t1 = texture(texSampler[1], tileUV).rgb;
+    vec3 t2 = texture(texSampler[2], tileUV).rgb;
+    vec3 t3 = texture(texSampler[3], tileUV).rgb;
+    vec3 col = t0 * w.r + t1 * w.g + t2 * w.b + t3 * w.a;
 
     // Dynamic Lambert lighting (mirrors actor_lit.frag).
     vec3 N = normalize(fragNormal);

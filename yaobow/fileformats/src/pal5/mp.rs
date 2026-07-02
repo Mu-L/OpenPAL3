@@ -7,32 +7,33 @@
 //! grid (16×16 cells, 20 units/cell) with shared edges between
 //! neighbours.
 //!
-//! ## Record layout (floats, little-endian)
-//! The fixed head of every record — **textured or not** — is 1458 floats:
+//! ## Record layout (little-endian; offsets in `f32`/`i32` words relative to
+//! the record start `o` used by the scan parser)
 //!
-//! | offset | count | field |
-//! |--------|-------|-------|
-//! | 0      | 289   | per-vertex texture-layer index (`-1.0` = none, else `0..N`) |
-//! | 289    | 13    | metadata: `[8]`=minX `[10]`=minZ `[5]`=maxX `[7]`=maxZ (bbox) |
-//! | 302    | 289   | per-vertex height (Y) |
-//! | 591    | 867   | per-vertex normal, interleaved `(nx,ny,nz)` ×289 |
+//! | offset  | count | field |
+//! |---------|-------|-------|
+//! | `+289`  | 13    | metadata: `[5]`=maxX `[7]`=maxZ `[8]`=minX `[10]`=minZ (bbox; patch is 320×320) |
+//! | `+302`  | 289   | per-vertex height (Y) |
+//! | `+591`  | 867   | per-vertex normal, interleaved `(nx,ny,nz)` ×289 |
+//! | `+1458` | 289   | per-vertex baked color (`D3DCOLOR`-as-`f32`; unused here) |
+//! | `+1747` | 4     | **overlay palette**: four `TerrainTexture` ids (`-1` = unused slot) |
+//! | `+1751` | 1     | `count` `C` of `(vertexIndex, layer)` pairs |
+//! | `+1752` | `2C`  | `(vertexIndex 0..288, layer 0..3)` pairs — per-vertex overlay coverage |
+//! | after   | 1     | trailing **base-ground** `TerrainTexture` id (present iff `C > 0`) |
 //!
-//! Textured patches append a small **variable-length tail** after this
-//! fixed head (per-layer blend data, ~3..230 floats) whose exact size is
-//! engine-internal. The geometry we need (heights at +302, normals at
-//! +591) lives at the same fixed offsets in *every* record, so we decode
-//! all of them and only the tail is skipped.
+//! The palette + coverage + base id are decoded by [`parse_patch_textures`].
+//! Untextured patches carry a palette but `C = 0` and no base id; they render
+//! as solid `palette[0]`.
 //!
-//! Because the tail makes the per-record stride variable, the parser
-//! **scans for each record-start signature** — a 320-aligned 320×320
-//! bbox at `+289` followed by plausible heights — which is robust against
-//! the variable tail. Earlier revisions additionally required the layer
-//! field to be entirely `-1.0`, which silently dropped every textured
-//! patch (≈23% of a map like `kuangfengzhai`) and left holes that had to
-//! be interpolated; the bbox signature alone recovers them. Validated by
-//! inter-patch edge-height continuity (shared-edge heights of textured
-//! patches match their neighbours to <0.5u). See
-//! `generated/pal5_tree_texture.md` and the session `mp_re_findings.md`.
+//! Because the tail after the geometry has a **variable length** (it grows with
+//! `C`), the parser **scans for each record-start signature** — a 320-aligned
+//! 320×320 bbox at `+289` followed by plausible heights — which re-syncs on
+//! every record regardless of the tail. This layout (and the palette offset)
+//! was verified clean-room by dynamic RE of the shipped `Pal5.exe`
+//! (`FUN_0077bc20` / `FUN_006d4510`) and cross-checked against
+//! `kuangfengzhai_0_0.mp`, where the entrance-road patches carry `zhuan024`
+//! (mossy flagstone) in their palette. Geometry is additionally validated by
+//! inter-patch edge-height continuity (<0.5u).
 
 use serde::Serialize;
 
@@ -42,6 +43,17 @@ const PATCH_VERTS: usize = PATCH_EDGE * PATCH_EDGE; // 289
 const META_OFF: usize = 289;
 const HEIGHT_OFF: usize = 302;
 const NORMAL_OFF: usize = 591;
+/// Per-vertex baked-color (D3DCOLOR-as-`f32`) block, right after the normals.
+const COLOR_OFF: usize = NORMAL_OFF + PATCH_VERTS * 3; // 1458
+/// Overlay palette: four `TerrainTexture` ids painting this patch's layers,
+/// stored immediately after the per-vertex color block (i.e. these are the
+/// four `f32`/`i32` words the loader `FUN_0077bc20` reads just before the
+/// pair-count). Dynamically verified: the road patches carry `zhuan024` here.
+const PALETTE_OFF: usize = COLOR_OFF + PATCH_VERTS; // 1747
+/// Number of `(vertexIndex, layer)` pairs that follow the palette.
+const COUNT_OFF: usize = PALETTE_OFF + 4; // 1751
+/// First `(vertexIndex, layer)` pair.
+const PAIRS_OFF: usize = COUNT_OFF + 1; // 1752
 
 /// Header magic shared by PAL5 GameBox containers (`.mp`/`.nod`/`.env`).
 const GAMEBOX_MAGIC: u32 = 0x0001_e240;
@@ -69,6 +81,23 @@ pub struct MpPatch {
     pub heights: Vec<f32>,
     /// Per-vertex normal, same indexing as [`MpPatch::heights`].
     pub normals: Vec<MpVertexNormal>,
+    /// This patch's **own** four `TerrainTexture` overlay-palette slots, or
+    /// `[-1; 4]` when the patch carries no palette. `tex_table[layer]` is the
+    /// `TerrainTexture` id painted by [`MpPatch::vert_layer`] entries equal to
+    /// `layer`. Unlike the earlier (wrong) front-scan model, this palette lives
+    /// at a fixed tail offset ([`PALETTE_OFF`]); the road/cobblestone textures
+    /// (e.g. `zhuan024`) live here.
+    pub tex_table: [i32; 4],
+    /// Per-vertex texture-layer assignment, same indexing as
+    /// [`MpPatch::heights`]: `vert_layer[v]` selects which of the four
+    /// [`MpPatch::tex_table`] slots paints vertex `v`, or `-1` if the vertex
+    /// is not covered by this patch's overlay list.
+    pub vert_layer: Vec<i8>,
+    /// Trailing base-ground `TerrainTexture` id under the overlays (e.g.
+    /// `dibiao425`/`dibiao424`), present only on textured patches (pair
+    /// `count > 0`); `-1` when the patch is untextured (it then renders solid
+    /// `tex_table[0]`).
+    pub base_id: i32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -164,6 +193,72 @@ fn parse_block_texture_ids(body: &[u8]) -> [i32; 4] {
     [-1; 4]
 }
 
+/// Decode a patch record's overlay palette, per-vertex layer assignment, and
+/// trailing base-ground id from the fixed **tail** of the record.
+///
+/// Layout (float-word indices relative to the record start `o`, all values
+/// little-endian; ids/count are `i32`): after the per-vertex color block at
+/// [`COLOR_OFF`] come
+/// ```text
+/// [PALETTE_OFF .. +4]  i32 palette[4];      // -1 = unused overlay slot
+/// [COUNT_OFF]          i32 count;           // number of (vtx, layer) pairs
+/// [PAIRS_OFF ..]       (i32 vtx, i32 layer) × count;
+/// [after pairs]        i32 base_id;         // trailing base ground (count>0)
+/// ```
+/// Verified clean-room from the shipped `Pal5.exe` terrain loader
+/// (`FUN_0077bc20`) via dynamic RE (breakpoint on `FUN_006d4510`, patch+0xa8 =
+/// palette) and cross-checked against `kuangfengzhai_0_0.mp`. Returns
+/// `([-1;4], all -1, -1)` when the tail is out of range or the palette is
+/// implausible.
+fn parse_patch_textures(
+    fi: &impl Fn(usize) -> i32,
+    o: usize,
+    nf: usize,
+) -> ([i32; 4], Vec<i8>, i32) {
+    let mut vert_layer = vec![-1i8; PATCH_VERTS];
+
+    if o + COUNT_OFF >= nf {
+        return ([-1; 4], vert_layer, -1);
+    }
+    let pal = [
+        fi(o + PALETTE_OFF),
+        fi(o + PALETTE_OFF + 1),
+        fi(o + PALETTE_OFF + 2),
+        fi(o + PALETTE_OFF + 3),
+    ];
+    // The palette must be four `TerrainTexture` ids (`-1` = unused), at least
+    // one used. This rejects the rare record whose tail was clipped at EOF.
+    let pal_ok = pal.iter().all(|&x| (-1..=224).contains(&x)) && pal.iter().any(|&x| x >= 0);
+    if !pal_ok {
+        return ([-1; 4], vert_layer, -1);
+    }
+
+    let count = fi(o + COUNT_OFF);
+    if !(0..=PATCH_VERTS as i32).contains(&count) {
+        // Palette present but no valid pair list: solid `palette[0]`.
+        return (pal, vert_layer, -1);
+    }
+    let c = count as usize;
+    if o + PAIRS_OFF + 2 * c > nf {
+        return (pal, vert_layer, -1);
+    }
+    for k in 0..c {
+        let vtx = fi(o + PAIRS_OFF + 2 * k);
+        let lay = fi(o + PAIRS_OFF + 2 * k + 1);
+        if (0..PATCH_VERTS as i32).contains(&vtx) && (0..=3).contains(&lay) {
+            vert_layer[vtx as usize] = lay as i8;
+        }
+    }
+    // Untextured patches (`count == 0`) carry no trailing base id.
+    let base_id = if c > 0 {
+        let off = o + PAIRS_OFF + 2 * c;
+        if off < nf { fi(off) } else { -1 }
+    } else {
+        -1
+    };
+    (pal, vert_layer, base_id)
+}
+
 /// Reinterpret the inflated body as `f32`s and walk the variable-length
 /// per-patch records, keying on the record-start signature.
 fn parse_patches(body: &[u8]) -> Vec<MpPatch> {
@@ -174,6 +269,10 @@ fn parse_patches(body: &[u8]) -> Vec<MpPatch> {
     };
 
     let mut patches = Vec::new();
+    let fi = |i: usize| -> i32 {
+        let o = i * 4;
+        i32::from_le_bytes([body[o], body[o + 1], body[o + 2], body[o + 3]])
+    };
     // Scan the whole body for record-start signatures. A sequential
     // record-to-record walk is not possible because textured patches carry
     // a variable-length tail after the fixed 1458-float head, so the stride
@@ -204,11 +303,15 @@ fn parse_patches(body: &[u8]) -> Vec<MpPatch> {
                 z: f(b + 2),
             });
         }
+        let (tex_table, vert_layer, base_id) = parse_patch_textures(&fi, o, nf);
         patches.push(MpPatch {
             min_x,
             min_z,
             heights,
             normals,
+            tex_table,
+            vert_layer,
+            base_id,
         });
 
         // Every record is at least one fixed head (`REC_HEAD_FLOATS`) long,
@@ -269,20 +372,17 @@ mod tests {
     use super::*;
 
     /// Build a synthetic inflated body containing `n` header pad floats
-    /// followed by one untextured patch record, then wrap it as a
-    /// GameBox `.mp` (header + zlib body) and decode it.
+    /// followed by one untextured patch record (palette all `-1`), then wrap it
+    /// as a GameBox `.mp` (header + zlib body) and decode it.
     #[test]
     fn decodes_single_untextured_patch() {
         let mut body: Vec<f32> = Vec::new();
         // Header pad (kept short; the parser scans for the first record).
         body.extend(std::iter::repeat(0.0).take(8));
 
-        // One record (1458 floats).
-        let mut rec = vec![0.0f32; REC_HEAD_FLOATS];
-        // layer: all -1
-        for v in 0..PATCH_VERTS {
-            rec[v] = -1.0;
-        }
+        // One record: fixed head + tail (palette/count). Size generously.
+        let mut rec = vec![0.0f32; PAIRS_OFF + 8];
+        let i = |v: i32| f32::from_bits(v as u32);
         // meta bbox: minX=320, minZ=640, maxX=640, maxZ=960
         rec[META_OFF + 8] = 320.0; // minX
         rec[META_OFF + 10] = 640.0; // minZ
@@ -298,6 +398,11 @@ mod tests {
             rec[NORMAL_OFF + v * 3 + 1] = 1.0;
             rec[NORMAL_OFF + v * 3 + 2] = 0.0;
         }
+        // palette: all -1 (untextured); count 0.
+        for k in 0..4 {
+            rec[PALETTE_OFF + k] = i(-1);
+        }
+        rec[COUNT_OFF] = i(0);
         body.extend_from_slice(&rec);
         // Trailing pad so the record isn't at the very end.
         body.extend(std::iter::repeat(0.0).take(16));
@@ -320,6 +425,62 @@ mod tests {
         assert_eq!(p.heights[0], 0.0);
         assert_eq!(p.heights[288], 288.0);
         assert!((p.normals[0].y - 1.0).abs() < 1e-6);
+        // An all-`-1` palette is untextured: no per-patch table, no base id.
+        assert_eq!(p.tex_table, [-1; 4]);
+        assert!(p.vert_layer.iter().all(|&l| l == -1));
+        assert_eq!(p.base_id, -1);
+    }
+
+    /// Build a record whose tail carries the overlay palette + count +
+    /// `(vtx, layer)` pairs + trailing base id, and verify
+    /// [`parse_patch_textures`] recovers all three.
+    #[test]
+    fn decodes_textured_patch_table() {
+        let mut body: Vec<f32> = Vec::new();
+        body.extend(std::iter::repeat(0.0).take(8));
+
+        // Tail: palette [5,10,1,-1] @PALETTE_OFF, count 2 @COUNT_OFF,
+        // pairs (vtx 3, layer 0), (vtx 7, layer 2) @PAIRS_OFF, base 52 after.
+        let mut rec = vec![0.0f32; PAIRS_OFF + 2 * 2 + 4];
+        let i = |v: i32| f32::from_bits(v as u32);
+        rec[PALETTE_OFF] = i(5);
+        rec[PALETTE_OFF + 1] = i(10);
+        rec[PALETTE_OFF + 2] = i(1);
+        rec[PALETTE_OFF + 3] = i(-1);
+        rec[COUNT_OFF] = i(2);
+        rec[PAIRS_OFF] = i(3);
+        rec[PAIRS_OFF + 1] = i(0);
+        rec[PAIRS_OFF + 2] = i(7);
+        rec[PAIRS_OFF + 3] = i(2);
+        rec[PAIRS_OFF + 4] = i(52); // trailing base id
+        // meta bbox
+        rec[META_OFF + 8] = 320.0;
+        rec[META_OFF + 10] = 640.0;
+        rec[META_OFF + 5] = 640.0;
+        rec[META_OFF + 7] = 960.0;
+        for v in 0..PATCH_VERTS {
+            rec[HEIGHT_OFF + v] = v as f32;
+            rec[NORMAL_OFF + v * 3 + 1] = 1.0;
+        }
+        body.extend_from_slice(&rec);
+        body.extend(std::iter::repeat(0.0).take(16));
+
+        let body_bytes: Vec<u8> = body.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let zlib = miniz_oxide::deflate::compress_to_vec_zlib(&body_bytes, 6);
+        let mut file = Vec::new();
+        file.extend_from_slice(&GAMEBOX_MAGIC.to_le_bytes());
+        file.extend(std::iter::repeat(0u8).take(0x3c - 4));
+        file.extend_from_slice(&zlib);
+
+        let mp = MpFile::read(&file).expect("decode");
+        assert_eq!(mp.patches.len(), 1);
+        let p = &mp.patches[0];
+        assert_eq!(p.tex_table, [5, 10, 1, -1]);
+        assert_eq!(p.vert_layer[3], 0);
+        assert_eq!(p.vert_layer[7], 2);
+        // every other vertex is untextured
+        assert_eq!(p.vert_layer.iter().filter(|&&l| l >= 0).count(), 2);
+        assert_eq!(p.base_id, 52);
     }
 
     #[test]

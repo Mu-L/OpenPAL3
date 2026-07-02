@@ -35,20 +35,43 @@
 //! ```text
 //! u32 width    = 64
 //! u32 height   = 64
-//! u32 encoded  // 0..3, activates slots 0..=encoded
+//! u32 encoded  // 0..3, number of *extra* blend layers (active layers = +1)
 //! u32 pixels[64*64]   // raster-scan, each pixel packs 4 weight bytes
 //! …trailing scratch (buffer over-allocation, ignored)
 //! ```
-//! Each pixel's four little-endian bytes `[b0,b1,b2,b3]` are per-channel
-//! weights that **sum to 255**, mapped to the four texture slots as
-//! (matching the exe's channel-select at `0x00766462`):
+//! Each pixel's four little-endian bytes `[b0, b1, b2, b3]` are per-channel
+//! weights that **sum to 255**, and map **one-to-one to the four texture
+//! slots in order**: byte `b_j` is the blend weight for the `.mp` footer
+//! texture slot `j`.
 //! ```text
-//! slot0 ← b2   slot1 ← b1   slot2 ← b0   slot3 ← b3
+//! slot0 ← b0   slot1 ← b1   slot2 ← b2   slot3 ← b3
 //! ```
-//! `encoded` activates slots `0..=encoded`, so the patch blends
-//! `encoded + 1` layers. [`AlpPatch::planes`] are returned in slot order
-//! (`planes[0]` = slot 0 = the base layer), each paired with the matching
-//! `.mp` footer texture id.
+//! The channels are used in a priority order though: a patch with `encoded +
+//! 1` active layers carries its weight in exactly bytes `{b2, b1, b0, b3}[0..=
+//! encoded]`. So `b2` is the always-present primary (open ground → slot 2,
+//! typically grass), `b1` the first overlay (→ slot 1, e.g. the road's
+//! ground), then `b0` (→ slot 0) and `b3` (→ slot 3). A single-layer
+//! (`encoded = 0`) patch is **100% `b2` → slot 2**.
+//!
+//! Single-/base-texture blocks therefore park their full weight on slot 2 even
+//! when their only valid footer id is at slot 0; the terrain builder folds
+//! weight on unused slots (footer id `-1`) back into the base layer (slot 0),
+//! so this resolves correctly.
+//!
+//! [`AlpPatch::planes`] always holds **four** rasters, `planes[j]` = byte
+//! `b_j` = the weight for texture slot `j` (paired with `.mp` footer
+//! `texture_ids[j]`).
+//!
+//! This identity mapping was pinned against the rendered terrain on
+//! `kuangfengzhai`: `b2` (open ground, ~78%) is the grass slot (footer slot 2 =
+//! `cao002`) and `b1` (the road, ~15%) is the warm-tan ground at footer slot 1
+//! (`shan035`) — sampled road colour `(179,149,110)` matches the original's
+//! `(157,140,91)`. Note footer slot 3 (`zhuan042`) is genuinely a *blue*-grey
+//! texture in the shipped assets (verified by three independent DXT3 decoders);
+//! it is only a minor ~0.4% terrain detail here, so routing the road to it
+//! (an earlier `[0,3,2,1]` mapping) wrongly painted the path purple. An even
+//! earlier `slot0 ← b2` mapping painted the whole village with the slot-0 clay
+//! (`jiaotu001`).
 //!
 //! All offsets/sizes and the codec were derived clean-room from the shipped
 //! binaries (no external PAL5 implementation was consulted).
@@ -65,18 +88,18 @@ pub const WEIGHT_TEXELS: usize = WEIGHT_EDGE * WEIGHT_EDGE;
 /// Decompressed patch buffer size the game allocates: `(64*64 + 0x40c) * 4`.
 const DECOMP_LEN: usize = (WEIGHT_TEXELS + 0x40c) * 4;
 
-/// Packed-pixel byte channel that feeds each texture slot (`slot s` reads
-/// byte `SLOT_TO_BYTE[s]`). Derived from the exe's channel-select code.
-const SLOT_TO_BYTE: [usize; 4] = [2, 1, 0, 3];
-
 /// One decoded patch's blend weights.
 #[derive(Debug, Clone, Serialize)]
 pub struct AlpPatch {
-    /// Number of active blend layers / slots (`encoded + 1`, range 1..=4).
+    /// Number of active blend layers (`encoded + 1`, range 1..=4). Informational
+    /// only — the active channels are the byte-priority prefix `[b2, b1, b0,
+    /// b3]` (→ slots `[2, 1, 0, 3]`; see module docs); use [`AlpPatch::planes`]
+    /// (always four channels, one per texture slot) for the actual weights.
     pub layer_count: u8,
-    /// Per-slot 64×64 weight raster in slot order (`planes[0]` = slot 0 =
-    /// base), row-major (`row * 64 + col`), values `0..=255`. For any texel
-    /// the active planes sum to 255. Empty if the blob failed to decode.
+    /// Per-texture-slot 64×64 weight raster: `planes[j]` is the weight for
+    /// texture slot `j` (`.mp` footer `texture_ids[j]`), row-major
+    /// (`row * 64 + col`), values `0..=255`. Always four entries; for any texel
+    /// the four sum to 255. Empty only if the blob failed to decode.
     pub planes: Vec<Vec<u8>>,
 }
 
@@ -161,7 +184,8 @@ fn recover_blob_ranges(raw: &[u8]) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// Decode one LZO1X-compressed patch blob into its per-slot weight rasters.
+/// Decode one LZO1X-compressed patch blob into its four per-texture-slot
+/// weight rasters (`planes[j]` = packed byte `b_j` = weight for slot `j`).
 fn decode_patch(raw: &[u8], off: usize, len: usize, lzo: Option<&minilzo_rs::LZO>) -> AlpPatch {
     let empty = AlpPatch {
         layer_count: 0,
@@ -182,37 +206,114 @@ fn decode_patch(raw: &[u8], off: usize, len: usize, lzo: Option<&minilzo_rs::LZO
         return empty;
     }
     let encoded = read_u32(&decomp, 8).min(3) as usize;
-    let layer_count = encoded + 1; // slots 0..=encoded are active
+    let layer_count = (encoded + 1) as u8; // informational; see module docs
 
-    let planes = (0..layer_count)
+    // One raster per texture slot: `planes[j]` is packed byte `b_j` (the
+    // weight for footer texture slot `j`). All four are emitted; inactive
+    // slots are naturally ~0 in the packed pixels.
+    let planes = (0..4)
         .map(|slot| {
-            let ch = SLOT_TO_BYTE[slot];
             (0..WEIGHT_TEXELS)
-                .map(|i| decomp[12 + i * 4 + ch])
+                .map(|i| decomp[12 + i * 4 + slot])
                 .collect::<Vec<u8>>()
         })
         .collect::<Vec<_>>();
 
     AlpPatch {
-        layer_count: layer_count as u8,
+        layer_count,
         planes,
     }
 }
 
 /// Map a terrain-texture id to its `TerrainTexture\*.dds` filename (without
-/// directory). Ids index the `Texture.pkg` `\TerrainTexture\` package
-/// order. Returns `None` for out-of-range ids.
+/// directory). Ids are the `TextureID` field of `Config/Data/T_textureConfig.ini`
+/// (the value stored in `.mp` patch tables). Returns `None` for out-of-range ids.
 pub fn terrain_texture_name(id: u8) -> Option<&'static str> {
     TERRAIN_TEXTURES.get(id as usize).copied()
 }
 
-/// The 225 PAL5 terrain textures in `Texture.pkg` `\TerrainTexture\`
-/// package order; the index is the id used to reference a terrain layer.
-/// Transcribed clean-room from the shipped `Texture.pkg` entry order.
-pub static TERRAIN_TEXTURES: [&str; 225] = [
+/// The 220 PAL5 terrain textures registered in `Config/Data/T_textureConfig.ini`,
+/// indexed by the `TextureID` field (which is what `.mp` patch tables store).
+/// The section name in that ini is the `TerrainTexture\\<name>.dds` base name.
+/// Transcribed clean-room from the shipped `T_textureConfig.ini`.
+pub static TERRAIN_TEXTURES: [&str; 220] = [
+    "Cl001.dds",
+    "Cl002.dds",
+    "Cl003.dds",
+    "Cl004.dds",
+    "Cl005.dds",
+    "Cl006.dds",
+    "Cl007.dds",
+    "Cl008.dds",
+    "Cl009.dds",
+    "Cl010.dds",
+    "Cl011.dds",
+    "shan001.dds",
+    "shan002.dds",
+    "shan003.dds",
+    "shan004.dds",
+    "shan005.dds",
+    "shan006.dds",
+    "shan007.dds",
+    "shan008.dds",
+    "shan009.dds",
+    "zhuan001.dds",
+    "zhuan002.dds",
+    "zhuan003.dds",
+    "zhuan004.dds",
+    "zhuan005.dds",
+    "zhuan006.dds",
+    "zhuan007.dds",
+    "zhuan008.dds",
+    "shan010.dds",
+    "shan011.dds",
+    "shan012.dds",
+    "waicheng_zhuan001.dds",
+    "waicheng_zhuan002.dds",
+    "waicheng_zhuan003.dds",
+    "waicheng_zhuan004.dds",
+    "waicheng_water001.dds",
+    "waicheng_water002.dds",
+    "waicheng_water003.dds",
+    "zhuan009.dds",
+    "zhuan010.dds",
+    "zhuan011.dds",
+    "zhuan012.dds",
+    "shan013.dds",
+    "shan014.dds",
+    "shan015.dds",
+    "shan016.dds",
+    "shan017.dds",
+    "shan018.dds",
+    "shan019.dds",
+    "shan020.dds",
+    "shan021.dds",
+    "dibiao424.dds",
+    "dibiao425.dds",
+    "dibiao426.dds",
+    "dibiao427.dds",
+    "dibiao428.dds",
+    "dibiao429.dds",
+    "shan022.dds",
+    "shan023.dds",
+    "shan024.dds",
+    "shan025.dds",
+    "shan026.dds",
+    "shan027.dds",
+    "shan028.dds",
+    "shan029.dds",
+    "shan030.dds",
+    "zhuan013.dds",
+    "shan031.dds",
     "cao001.dds",
+    "sha001.dds",
+    "sadi001.dds",
+    "tudi001.dds",
     "cao002.dds",
+    "shan032.dds",
     "cao003.dds",
+    "sadi002.dds",
+    "tudi002.dds",
     "cao004.dds",
     "cao005.dds",
     "cao006.dds",
@@ -228,130 +329,22 @@ pub static TERRAIN_TEXTURES: [&str; 225] = [
     "cao016.dds",
     "cao017.dds",
     "cao018.dds",
-    "cao019.dds",
-    "cao020.dds",
-    "cao021.dds",
-    "cao022.dds",
-    "cao023.dds",
-    "Cl001.dds",
-    "Cl002.dds",
-    "Cl003.dds",
-    "Cl004.dds",
-    "Cl005.dds",
-    "Cl006.dds",
-    "Cl007.dds",
-    "Cl008.dds",
-    "Cl009.dds",
-    "Cl010.dds",
-    "Cl011.dds",
-    "Cl012.dds",
-    "dibiao424.dds",
-    "dibiao425.dds",
-    "dibiao426.dds",
-    "dibiao427.dds",
-    "dibiao428.dds",
-    "dibiao429.dds",
-    "dibiao430.dds",
-    "huacao001.dds",
-    "huacao002.dds",
-    "huacao003.dds",
-    "huacao004.DDS",
-    "jiaotu001.dds",
-    "LU-1.DDS",
-    "LU-2.DDS",
-    "LU-3.DDS",
-    "LU-4.DDS",
-    "LU-5.dds",
-    "LU-6.DDS",
     "Luoye001.dds",
     "Luoye002.dds",
-    "Luoye003.dds",
-    "Luoye004.dds",
-    "Luoye005.dds",
     "Luoye022.dds",
-    "luoye023.dds",
-    "luoye024.dds",
-    "luoye025.dds",
-    "luoye026.dds",
-    "luoye027.dds",
-    "plhy001.dds",
-    "plhy002.dds",
-    "plhy003.dds",
-    "plhy004.dds",
-    "sadi001.dds",
-    "sadi002.dds",
-    "sadi003.dds",
-    "sha001.dds",
-    "shan001.dds",
-    "shan002.dds",
-    "shan003.dds",
-    "shan004.dds",
-    "shan005.dds",
-    "shan006.dds",
-    "shan007.dds",
-    "shan008.dds",
-    "shan009.dds",
-    "shan010.dds",
-    "shan011.dds",
-    "shan012.dds",
-    "shan013.dds",
-    "shan014.dds",
-    "shan015.dds",
-    "shan016.dds",
-    "shan017.dds",
-    "shan018.dds",
-    "shan019.dds",
-    "shan020.dds",
-    "shan021.dds",
-    "shan022.dds",
-    "shan023.dds",
-    "shan024.dds",
-    "shan025.dds",
-    "shan026.dds",
-    "shan027.dds",
-    "shan028.dds",
-    "shan029.dds",
-    "shan030.dds",
-    "shan031.dds",
-    "shan032.dds",
     "shan033.dds",
-    "shan034.dds",
-    "shan035.dds",
-    "shan036.dds",
-    "shan037.dds",
-    "shan038.dds",
-    "shan039.dds",
-    "shan040.dds",
-    "shan041.DDS",
-    "shan042.dds",
-    "shan043.dds",
-    "shan044.dds",
-    "shan045.dds",
-    "shan046.dds",
-    "shan047.dds",
-    "shan048.dds",
-    "shan049.dds",
-    "shan050.dds",
-    "shiban01.dds",
-    "shiban02.dds",
-    "shiban03.dds",
-    "suishi001.dds",
-    "suishi002.dds",
-    "suishi003.dds",
-    "suishi004.dds",
-    "suishi005.dds",
-    "suishi006.dds",
-    "suishi007.dds",
-    "tangfucao001.dds",
-    "tangfudi002.dds",
-    "tudi001.dds",
-    "tudi002.dds",
+    "zhuan014.dds",
+    "zhuan015.dds",
+    "zhuan016.dds",
+    "zhuan017.dds",
+    "zhuan018.dds",
+    "zhuan019.dds",
+    "zhuan020.dds",
+    "zhuan021.dds",
+    "zhuan022.dds",
     "tudi003.dds",
     "tudi004.dds",
     "tudi005.dds",
-    "tudi0051.dds",
-    "tudi005aa.dds",
-    "tudi005_NRM.dds",
     "tudi006.dds",
     "tudi007.dds",
     "tudi008.dds",
@@ -363,78 +356,107 @@ pub static TERRAIN_TEXTURES: [&str; 225] = [
     "tudi014.dds",
     "tudi015.dds",
     "tudi016.dds",
-    "tudi017.dds",
-    "tudi018.dds",
-    "tudi019.dds",
-    "tudi020.dds",
-    "tudi021.dds",
-    "tudi022.dds",
-    "tudi023.DDS",
-    "tudi024.dds",
-    "tudi025.dds",
-    "waicheng_water001.dds",
-    "waicheng_water002.dds",
-    "waicheng_water003.dds",
-    "waicheng_zhuan001.dds",
-    "waicheng_zhuan002.dds",
-    "waicheng_zhuan003.dds",
-    "waicheng_zhuan004.dds",
-    "waicheng_zhuan005.dds",
-    "xsl001.dds",
-    "xsl002.dds",
-    "xuedi001.dds",
-    "xuedi002.dds",
-    "zhuan001.dds",
-    "zhuan002.dds",
-    "zhuan003.dds",
-    "zhuan004.dds",
-    "zhuan005.dds",
-    "zhuan006.dds",
-    "zhuan007.dds",
-    "zhuan008.dds",
-    "zhuan009.dds",
-    "zhuan010.dds",
-    "zhuan011.dds",
-    "zhuan012.dds",
-    "zhuan013.dds",
-    "zhuan014.dds",
-    "zhuan015.dds",
-    "zhuan016.dds",
-    "zhuan017.dds",
-    "zhuan018.dds",
-    "zhuan019.dds",
-    "zhuan020.dds",
-    "zhuan021.dds",
-    "zhuan022.dds",
+    "shan034.dds",
+    "shan035.dds",
+    "shan036.dds",
+    "shan037.dds",
+    "shan038.dds",
+    "shan039.dds",
+    "shan040.dds",
+    "jiaotu001.dds",
+    "suishi001.dds",
+    "suishi002.dds",
+    "suishi003.dds",
+    "suishi004.dds",
+    "sadi003.dds",
     "zhuan023.dds",
     "zhuan024.dds",
     "zhuan025.dds",
+    "tudi017.dds",
+    "tudi018.dds",
+    "tudi019.dds",
     "zhuan026.dds",
-    "zhuan027.DDS",
+    "shan041.dds",
+    "cao019.dds",
+    "cao020.dds",
+    "shiban01.dds",
+    "tudi020.dds",
+    "tudi021.dds",
+    "luoye023.dds",
+    "shan042.dds",
+    "dibiao430.dds",
+    "waicheng_zhuan005.dds",
+    "shan043.dds",
+    "zhuan027.dds",
+    "shan044.dds",
     "zhuan028.dds",
+    "zhuan034.dds",
+    "zhuan035.dds",
+    "tudi022.dds",
+    "tudi023.dds",
+    "luoye003.dds",
+    "luoye004.dds",
+    "luoye005.dds",
+    "zhuan036.dds",
+    "zhuan037.dds",
+    "zhuan038.dds",
     "zhuan029.dds",
     "zhuan030.dds",
     "zhuan031.dds",
     "zhuan032.dds",
     "zhuan033.dds",
-    "zhuan034.dds",
-    "zhuan035.dds",
-    "zhuan036.dds",
-    "zhuan037.dds",
-    "zhuan038.DDS",
     "zhuan039.dds",
-    "zhuan040.dds",
-    "zhuan041.dds",
-    "zhuan042.dds",
-    "zhuan043.dds",
-    "zhuan044.DDS",
-    "zhuan045.dds",
-    "zhuan046.DDS",
-    "zhuan047.dds",
-    "zhuan048.dds",
+    "xuedi001.dds",
+    "xuedi002.dds",
+    "luoye024.dds",
+    "luoye025.dds",
+    "luoye026.dds",
+    "luoye027.dds",
+    "shan045.dds",
+    "shan046.dds",
+    "cao022.dds",
     "ztqshan030.dds",
     "ztqtudi016.dds",
     "ztqtudi022.dds",
+    "huacao001.dds",
+    "huacao002.dds",
+    "huacao003.dds",
+    "huacao004.dds",
+    "suishi005.dds",
+    "suishi006.dds",
+    "shan048.dds",
+    "plhy001.dds",
+    "plhy002.dds",
+    "plhy003.dds",
+    "plhy004.dds",
+    "zhuan040.dds",
+    "zhuan041.dds",
+    "xsl001.dds",
+    "xsl002.dds",
+    "tudi024.dds",
+    "suishi007.dds",
+    "LU-1.dds",
+    "LU-2.dds",
+    "LU-3.dds",
+    "LU-4.dds",
+    "shan047.dds",
+    "cao023.dds",
+    "LU-5.dds",
+    "LU-6.dds",
+    "zhuan042.dds",
+    "zhuan043.dds",
+    "zhuan044.dds",
+    "zhuan045.dds",
+    "zhuan046.dds",
+    "tangfucao001.dds",
+    "tangfudi002.dds",
+    "tudi025.dds",
+    "CL012.dds",
+    "zhuan047.dds",
+    "zhuan048.dds",
+    "shiban03.dds",
+    "shan049.dds",
+    "shan050.dds",
 ];
 
 #[cfg(test)]
@@ -443,18 +465,21 @@ mod tests {
 
     #[test]
     fn texture_table_has_expected_anchors() {
-        assert_eq!(TERRAIN_TEXTURES.len(), 225);
-        assert_eq!(terrain_texture_name(0), Some("cao001.dds"));
-        assert_eq!(terrain_texture_name(23), Some("Cl001.dds"));
-        assert_eq!(terrain_texture_name(35), Some("dibiao424.dds"));
-        assert_eq!(terrain_texture_name(224), Some("ztqtudi022.dds"));
-        assert_eq!(terrain_texture_name(225), None);
+        // Indices are the `T_textureConfig.ini` `TextureID` field.
+        assert_eq!(TERRAIN_TEXTURES.len(), 220);
+        assert_eq!(terrain_texture_name(0), Some("Cl001.dds"));
+        assert_eq!(terrain_texture_name(1), Some("Cl002.dds"));
+        // kuangfengzhai cobblestone road dominant.
+        assert_eq!(terrain_texture_name(133), Some("zhuan024.dds"));
+        assert_eq!(terrain_texture_name(215), Some("zhuan047.dds"));
+        assert_eq!(terrain_texture_name(219), Some("shan050.dds"));
+        assert_eq!(terrain_texture_name(220), None);
     }
 
     /// Build a synthetic `.alp`: a 256-entry table whose first blob is an
     /// LZO1X stream of a single-layer (`encoded = 0`) 64×64 weight raster
-    /// where slot 0 (byte channel 2) is 255. Decode and confirm the table
-    /// recovery, LZO decode, and slot extraction.
+    /// where byte `b2` (the primary/base channel) is 255. Decode and confirm
+    /// the table recovery, LZO decode, and per-slot extraction (`planes[2]`).
     #[test]
     fn decodes_single_layer_patch() {
         let mut lzo = minilzo_rs::LZO::init().unwrap();
@@ -464,7 +489,7 @@ mod tests {
         decomp[4..8].copy_from_slice(&(WEIGHT_EDGE as u32).to_le_bytes());
         decomp[8..12].copy_from_slice(&0u32.to_le_bytes()); // encoded = 0
         for i in 0..WEIGHT_TEXELS {
-            decomp[12 + i * 4 + SLOT_TO_BYTE[0]] = 255; // slot 0 -> byte 2
+            decomp[12 + i * 4 + 2] = 255; // b2 -> texture slot 2
         }
         let blob = lzo.compress(&decomp).unwrap();
 
@@ -482,9 +507,13 @@ mod tests {
         assert_eq!(alp.patches.len(), 256);
         let p0 = &alp.patches[0];
         assert_eq!(p0.layer_count, 1);
-        assert_eq!(p0.planes.len(), 1);
-        assert_eq!(p0.planes[0].len(), WEIGHT_TEXELS);
-        assert!(p0.planes[0].iter().all(|&w| w == 255));
+        // Always four per-slot planes; the weight sits on slot 2 (byte b2).
+        assert_eq!(p0.planes.len(), 4);
+        assert_eq!(p0.planes[2].len(), WEIGHT_TEXELS);
+        assert!(p0.planes[2].iter().all(|&w| w == 255));
+        assert!(p0.planes[0].iter().all(|&w| w == 0));
+        assert!(p0.planes[1].iter().all(|&w| w == 0));
+        assert!(p0.planes[3].iter().all(|&w| w == 0));
         assert!(!p0.is_multilayer());
         assert_eq!(alp.patch(0, 0).map(|p| p.layer_count), Some(1));
     }
